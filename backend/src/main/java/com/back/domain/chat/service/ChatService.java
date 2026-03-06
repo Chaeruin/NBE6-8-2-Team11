@@ -16,6 +16,7 @@ import com.back.domain.notification.entity.Notification;
 import com.back.domain.notification.enums.NotificationType;
 import com.back.domain.notification.repository.NotificationRepository;
 import com.back.domain.notification.service.NotificationService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -29,6 +30,8 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Slf4j
 @Service
@@ -40,9 +43,9 @@ public class ChatService {
     private final MemberRepository memberRepository;
     private final SimpMessagingTemplate messagingTemplate;
     private final RedisTemplate<String, Object> redisTemplate;
-    private final RedisSubscriber redisSubscriber;
-    private final NotificationRepository notificationRepository;
     private final NotificationService notificationService;
+    private final ObjectMapper objectMapper;
+
 
     @Transactional
     public ChatRoomResponseDto createOrGetChatRoom(Long member1Id, Long member2Id) {
@@ -102,9 +105,6 @@ public class ChatService {
         ChatRoom chatRoom = chatRoomRepository.findById(roomId)
                 .orElseThrow(() -> new IllegalArgumentException("Chat room not found: " + roomId));
 
-        Member user = memberRepository.findById(userId)
-                .orElseThrow(() -> new IllegalArgumentException("User not found: " + userId));
-
         // 상대방 찾기
         Member opponent;
         if (chatRoom.getFirstMember().getId().equals(userId)) {
@@ -127,46 +127,24 @@ public class ChatService {
         Member sender = memberRepository.findById(request.senderId())
                 .orElseThrow(() -> new IllegalArgumentException("Sender not found: " + request.senderId()));
 
-        ChatMessage message = ChatMessage.builder()
-                .chatRoom(chatRoom)
-                .sender(sender)
-                .content(request.content())
-                .build();
-
-        ChatMessage savedMessage = chatMessageRepository.save(message);
+        ChatMessage message = chatMessageRepository.save(request.toEntity(chatRoom, sender));
+        ChatMessageResponseDto response = ChatMessageResponseDto.from(message);
 
         // Redis에 메시지 저장 (최근 100개 메시지, 24시간 유지)
         String redisKey = "chat:room:" + request.roomId() + ":messages";
-        ChatMessageDto savedMessageDto = ChatMessageDto.from(savedMessage);
-        redisTemplate.opsForList().rightPush(redisKey, savedMessageDto); // rightPush로 변경 (시간순 저장)
+        redisTemplate.opsForList().rightPush(redisKey, response); // rightPush로 변경 (시간순 저장)
         redisTemplate.opsForList().trim(redisKey, -100, -1); // 최근 100개만 유지 (오른쪽에서부터)
         redisTemplate.expire(redisKey, 24, TimeUnit.HOURS);
 
-        // Redis Pub/Sub으로 메시지 발행 (다른 서버 인스턴스에 전달)
-        String channel = "chat:room:" + request.roomId();
-        ChatMessageDto chatMessageDto = ChatMessageDto.from(savedMessage);
-        redisTemplate.convertAndSend(channel, chatMessageDto);
+        // Redis Pub/Sub 발행 (트랜잭션 커밋 후 전송 권장)
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                redisTemplate.convertAndSend("chat:room:" + request.roomId(), response);
+            }
+        });
 
-        // WebSocket으로 메시지 전송
-        ChatMessageResponseDto response = ChatMessageResponseDto.builder()
-                .messageId(savedMessage.getId())
-                .roomId(savedMessage.getChatRoom().getId())
-                .senderId(savedMessage.getSender().getId())
-                .senderName(savedMessage.getSender().getName())
-                .content(savedMessage.getContent())
-                .sentAt(savedMessage.getSentAt())
-                .build();
-
-        String destination = "/topic/chat/" + request.roomId();
-        log.info("Sending WebSocket message to destination: {}, message: {}", destination, response);
-        messagingTemplate.convertAndSend(destination, response);
-
-        return savedMessage;
-    }
-
-    public List<Object> getRecentMessagesFromRedis(Long roomId) {
-        String redisKey = "chat:room:" + roomId + ":messages";
-        return redisTemplate.opsForList().range(redisKey, 0, -1);
+        return message;
     }
 
     public List<ChatRoomResponseDto> getUserChatRooms(String memberEmail) {
@@ -181,27 +159,20 @@ public class ChatService {
     public void viewRecentMessagesToUser(String memberEmail, Long roomId) {
         List<Object> recentMessages = getRecentMessagesFromRedis(roomId);
 
+        if (recentMessages == null) return;
+
         Member member = memberRepository.findByEmail(memberEmail)
                 .orElseThrow(() -> new MemberException(MemberErrorCode.MEMBER_NOT_FOUND));
 
         // Redis에서 가져온 메시지들을 ChatMessageResponse로 변환
         List<ChatMessageResponseDto> messageResponses = recentMessages.stream()
-                .filter(obj -> obj instanceof ChatMessageDto)
-                .map(obj -> {
-                    ChatMessageDto messageDto = (ChatMessageDto) obj;
-                    return ChatMessageResponseDto.builder()
-                            .messageId(messageDto.id())
-                            .roomId(messageDto.chatRoomId())
-                            .senderId(messageDto.senderId())
-                            .senderName(messageDto.senderName())
-                            .content(messageDto.content())
-                            .sentAt(messageDto.sentAt())
-                            .build();
-                })
+                .map(obj -> objectMapper.convertValue(obj, ChatMessageResponseDto.class))
                 .toList();
 
-        // 사용자에게 최근 메시지 전송 -> roomId를 사용하여 특정 사용자에게 전송
-        messagingTemplate.convertAndSend("/queue/user/" + roomId + "/messages", messageResponses);
+        // 특정 사용자의 개인 큐로 최근 메시지 전송
+        // 프론트엔드는 /user/queue/chat/{roomId}/messages 주소를 구독해야 함
+        messagingTemplate.convertAndSendToUser(
+                member.getEmail(), "/queue/user/" + roomId + "/messages", messageResponses);
 
         log.info("Sent {} recent messages to user {} for room {}", messageResponses.size(), member.getId(), roomId);
     }
@@ -211,31 +182,23 @@ public class ChatService {
         ChatRoom chatRoom = chatRoomRepository.findById(roomId)
                 .orElseThrow(() -> new IllegalArgumentException("Chat room not found: " + roomId));
 
-        // Redis에서 채팅방 관련 데이터 삭제
+        // Redis에서 채팅방 관련 데이터 삭제 - 구독은 유지됨
         String redisKey = "chat:room:" + roomId + ":messages";
         redisTemplate.delete(redisKey);
-
-        // Redis Pub/Sub 채널 구독 해제
-        redisSubscriber.unsubscribeFromChatRoom(roomId);
 
         // DB에서 채팅방 삭제 (Cascade로 메시지도 자동 삭제)
         chatRoomRepository.delete(chatRoom);
 
         // 양쪽 사용자에게 채팅방 삭제 알림 전송 (순차적으로)
-        Long firstMemberId = chatRoom.getFirstMember().getId();
-        Long secondMemberId = chatRoom.getSecondMember().getId();
-        
-        // 첫 번째 멤버에게 알림
-        notificationService.sendChatDeleteNotification(firstMemberId, "채팅방이 삭제되었습니다");
-        
-        // 잠시 대기 후 두 번째 멤버에게 알림
-        try {
-            Thread.sleep(100);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        
-        notificationService.sendChatDeleteNotification(secondMemberId, "채팅방이 삭제되었습니다");
+        // 멤버 알림
+        notificationService.sendChatDeleteNotification(chatRoom.getFirstMember().getId(), "채팅방이 삭제되었습니다");
+        notificationService.sendChatDeleteNotification(chatRoom.getSecondMember().getId(), "채팅방이 삭제되었습니다");
+
         log.info("Chat room {} deleted, cleaned Redis data and notified users", roomId);
+    }
+
+    private List<Object> getRecentMessagesFromRedis(Long roomId) {
+        String redisKey = "chat:room:" + roomId + ":messages";
+        return redisTemplate.opsForList().range(redisKey, 0, -1);
     }
 }

@@ -1,13 +1,10 @@
 package com.back.domain.chat.service;
 
 
-import com.back.domain.chat.dto.ChatMessageDto;
 import com.back.domain.chat.dto.response.ChatMessageResponseDto;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.listener.ChannelTopic;
-import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
@@ -16,45 +13,20 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class RedisSubscriber {
 
-    private final RedisMessageListenerContainer redisMessageListenerContainer;
-    private final SimpMessagingTemplate messagingTemplate;
     private final ObjectMapper objectMapper;
+    private final SimpMessagingTemplate messagingTemplate;
 
-    public void subscribeToChatRoom(Long roomId) {
-        String channel = "chat:room:" + roomId;
-        ChannelTopic topic = new ChannelTopic(channel);
-        
-        redisMessageListenerContainer.addMessageListener((message, pattern) -> {
-            try {
-                // byte[]를 String으로 변환 후 JSON 역직렬화
-                byte[] messageBody = message.getBody();
-                String jsonString = new String(messageBody);
-                ChatMessageDto chatMessageDto = objectMapper.readValue(jsonString, ChatMessageDto.class);
-                
-                ChatMessageResponseDto response = ChatMessageResponseDto.builder()
-                        .messageId(chatMessageDto.id())
-                        .roomId(chatMessageDto.chatRoomId())
-                        .senderId(chatMessageDto.senderId())
-                        .senderName(chatMessageDto.senderName())
-                        .content(chatMessageDto.content())
-                        .sentAt(chatMessageDto.sentAt())
-                        .build();
+    // Redis에서 메시지 pub 시 호출됨
+    public void sendMessage(String publishMessage) {
+        try {
+            // Redis에서 sub한 JSON 문자열을 DTO로 변환
+            ChatMessageResponseDto response = objectMapper.readValue(publishMessage, ChatMessageResponseDto.class);
 
-                messagingTemplate.convertAndSend("/topic/chat/" + roomId, response);
-                log.info("Message sent to room {}: {}", roomId, response.content());
-                
-            } catch (Exception e) {
-                log.error("Error processing message for room {}: {}", roomId, e.getMessage(), e);
-            }
-        }, topic);
-        
-        log.info("Subscribed to chat room: {}", roomId);
-    }
-
-    public void unsubscribeFromChatRoom(Long roomId) {
-        String channel = "chat:room:" + roomId;
-        ChannelTopic topic = new ChannelTopic(channel);
-        redisMessageListenerContainer.removeMessageListener(null, topic);
-        log.info("Unsubscribed from chat room: {}", roomId);
+            // WebSocket subcriber 들에게 메시지 전달
+            messagingTemplate.convertAndSend("/topic/chat/" + response.roomId(), response);
+            log.info("Redis Pub -> WebSocket Send: Room {}", response.roomId());
+        } catch (Exception e) {
+            log.error("Exception in RedisSubscriber: {}", e.getMessage());
+        }
     }
 } 

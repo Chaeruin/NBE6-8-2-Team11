@@ -2,9 +2,7 @@ package com.back.domain.chat.controller;
 
 import com.back.domain.chat.dto.request.ChatMessageRequestDto;
 import com.back.domain.chat.dto.response.ChatRoomResponseDto;
-import com.back.domain.chat.entity.ChatRoom;
 import com.back.domain.chat.service.ChatService;
-import com.back.domain.chat.service.RedisSubscriber;
 import com.back.global.common.ApiResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import lombok.RequiredArgsConstructor;
@@ -27,7 +25,6 @@ import java.util.List;
 public class ChatController {
 
     private final ChatService chatService;
-    private final RedisSubscriber redisSubscriber;
 
     @MessageMapping("/chat.sendMessage")
     @Operation(summary = "채팅 메시지 전송", description = "채팅방에 메시지를 전송합니다.")
@@ -45,14 +42,10 @@ public class ChatController {
         headerAccessor.getSessionAttributes().put("username", userDetails.getUsername());
         headerAccessor.getSessionAttributes().put("roomId", chatMessageRequest.roomId());
 
-        // Redis 채널 구독
-        redisSubscriber.subscribeToChatRoom(chatMessageRequest.roomId());
-
         // 채팅방 입장 처리 (상대방에게 알림)
         chatService.enterChatRoom(chatMessageRequest.roomId(), chatMessageRequest.senderId());
-
         // 최근 메시지 전송
-         chatService.viewRecentMessagesToUser(userDetails.getUsername(), chatMessageRequest.senderId());
+        chatService.viewRecentMessagesToUser(userDetails.getUsername(), chatMessageRequest.senderId());
 
         log.info("User {} added to room {}", chatMessageRequest.senderId(), chatMessageRequest.roomId());
     }
